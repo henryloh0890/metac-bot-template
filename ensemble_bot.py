@@ -31,6 +31,7 @@ import asyncio
 import itertools
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -41,6 +42,7 @@ from bot_helpers import (
     print_run_summary_banner,
     print_startup_banner,
 )
+import requests
 from forecasting_tools import (
     BinaryPrediction,
     BinaryQuestion,
@@ -54,12 +56,28 @@ from forecasting_tools import (
 logger = logging.getLogger(__name__)
 
 # Paid from the free Metaculus/OpenRouter credits (they cover OpenAI, Anthropic
-# and Google only). Swap in newer model names with the BOT_MODELS variable.
+# and Google only). Models get retired often, so each name below is checked
+# against OpenRouter's live model list at startup; a retired one is replaced by
+# the newest affordable model of the same family (see resolve_models).
 DEFAULT_MODELS = [
     "openrouter/anthropic/claude-sonnet-4.5",
     "openrouter/openai/gpt-5",
     "openrouter/google/gemini-2.5-pro",
 ]
+
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+# Max price per token (USD) for an automatically chosen replacement model.
+MAX_PROMPT_PRICE = 5e-6  # $5 per million input tokens
+MAX_COMPLETION_PRICE = 2.5e-5  # $25 per million output tokens
+# Name parts that mark variants we do not want as a forecaster.
+_SKIP_VARIANT = re.compile(
+    r"(:|(?<![a-z])(mini|nano|lite|flash|haiku|audio|image|vision|search|oss|"
+    r"preview|embed|tts|realtime|codex|instruct|banana|exp)(?![a-z]))",
+    re.IGNORECASE,
+)
+# Small, cheap variants used for parsing and summaries. (?<![a-z]) stops
+# "gemini" from counting as "mini".
+_SMALL_VARIANT = re.compile(r"(?<![a-z])(mini|haiku|flash)(?![a-z])", re.IGNORECASE)
 
 BINARY_MIN = 0.02
 BINARY_MAX = 0.98
@@ -82,6 +100,102 @@ def models_from_env() -> list[str]:
     return [m.strip() for m in raw.split(",") if m.strip()]
 
 
+def fetch_openrouter_models() -> list[dict] | None:
+    try:
+        resp = requests.get(OPENROUTER_MODELS_URL, timeout=30)
+        resp.raise_for_status()
+        return resp.json()["data"]
+    except Exception as e:  # network trouble must not stop the bot
+        logger.warning(f"Could not fetch the OpenRouter model list: {e}")
+        return None
+
+
+def _affordable(model: dict) -> bool:
+    try:
+        pricing = model.get("pricing", {})
+        return (
+            float(pricing.get("prompt", 1)) <= MAX_PROMPT_PRICE
+            and float(pricing.get("completion", 1)) <= MAX_COMPLETION_PRICE
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def best_in_family(vendor: str, catalog: list[dict], cheap: bool = False) -> str | None:
+    """Newest affordable main model of a vendor, e.g. 'anthropic'.
+
+    cheap=True picks the newest small model instead (for parsing/summaries).
+    """
+    candidates = []
+    for m in catalog:
+        mid = m.get("id", "")
+        if not mid.startswith(vendor + "/") or not _affordable(m):
+            continue
+        name = mid.split("/", 1)[1]
+        is_small = bool(_SMALL_VARIANT.search(name))
+        if cheap:
+            if not is_small or ":" in name or re.search(r"audio|image|search|preview|tts", name):
+                continue
+        elif _SKIP_VARIANT.search(name):
+            continue
+        candidates.append((m.get("created", 0), mid))
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
+def resolve_models(requested: list[str], catalog: list[dict] | None) -> list[str]:
+    """Keep requested models OpenRouter still serves; replace retired ones."""
+    if catalog is None:
+        return requested
+    available = {m.get("id") for m in catalog}
+    resolved: list[str] = []
+    for model in requested:
+        if not model.startswith("openrouter/"):
+            resolved.append(model)  # direct provider key, cannot check
+            continue
+        slug = model.removeprefix("openrouter/")
+        if slug in available:
+            resolved.append(model)
+            continue
+        vendor = slug.split("/", 1)[0]
+        replacement = best_in_family(vendor, catalog)
+        if replacement:
+            logger.warning(f"{slug} is no longer on OpenRouter; using {replacement}")
+            resolved.append("openrouter/" + replacement)
+        else:
+            logger.warning(f"{slug} is no longer on OpenRouter and has no replacement; dropped")
+    if not resolved:
+        raise RuntimeError("No usable forecasting model found on OpenRouter")
+    return list(dict.fromkeys(resolved))
+
+
+def helper_llms(panel: list[str], catalog: list[dict] | None) -> dict:
+    """Parser, summarizer and researcher that are known to exist.
+
+    The template's defaults (gpt-4o-mini, gpt-4o-search-preview) have been
+    retired on OpenRouter, which broke every question in the first live run.
+    """
+    cheap = None
+    if catalog is not None:
+        for vendor in ("anthropic", "google", "openai"):
+            cheap = best_in_family(vendor, catalog, cheap=True)
+            if cheap:
+                cheap = "openrouter/" + cheap
+                break
+    cheap = cheap or panel[0]
+    llms: dict = {"parser": make_llm(cheap), "summarizer": make_llm(cheap)}
+    has_asknews = (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) or os.getenv(
+        "ASKNEWS_API_KEY"
+    )
+    if has_asknews:
+        llms["researcher"] = "asknews/news-summaries"
+    else:
+        # OpenRouter's ":online" suffix adds a web search to any model.
+        llms["researcher"] = GeneralLlm(model=panel[0] + ":online", temperature=0.1, timeout=300)
+    return llms
+
+
 def clip_binary(p: float) -> float:
     return max(BINARY_MIN, min(BINARY_MAX, p))
 
@@ -90,8 +204,12 @@ class EnsembleBot(FallTemplateBot2026):
     """Template bot with a rotating multi-model forecasting panel."""
 
     def __init__(self, *args, forecaster_models: list[str] | None = None, **kwargs):
-        super().__init__(*args, **kwargs)
         models = forecaster_models or models_from_env()
+        if "llms" not in kwargs:
+            catalog = fetch_openrouter_models()
+            models = resolve_models(models, catalog)
+            kwargs["llms"] = helper_llms(models, catalog)
+        super().__init__(*args, **kwargs)
         self._forecasters = [make_llm(m) for m in models]
         self._forecaster_cycle = itertools.cycle(self._forecasters)
         logger.info(f"Forecasting panel: {[llm.model for llm in self._forecasters]}")
@@ -103,6 +221,15 @@ class EnsembleBot(FallTemplateBot2026):
             llm = next(self._forecaster_cycle)
             return llm.model if guarantee_type == "string_name" else llm
         return super().get_llm(purpose, guarantee_type)
+
+    async def run_research(self, question) -> str:
+        # A broken search must not cost us the whole question: forecast
+        # without news instead (the first live run lost every question this way).
+        try:
+            return await super().run_research(question)
+        except Exception as e:
+            logger.warning(f"Research failed for {question.page_url}, forecasting without it: {e}")
+            return "No research available. Rely on base rates and the question text."
 
     # ------------------------------------------------------------------ binary
 
