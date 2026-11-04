@@ -95,3 +95,71 @@ def test_prompt_contains_key_steps(monkeypatch):
     prompt = bot.build_binary_prompt(make_question(), "NEWS")
     for needle in ["Reference class", "Status quo", "NEWS", "Probability: ZZ%"]:
         assert needle in prompt
+
+
+# ---------------------------------------------------------------- model list
+
+CATALOG = [
+    {"id": "anthropic/claude-sonnet-5.5", "created": 300, "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+    {"id": "anthropic/claude-opus-5.5", "created": 310, "pricing": {"prompt": "0.000015", "completion": "0.000075"}},
+    {"id": "anthropic/claude-haiku-5.5", "created": 305, "pricing": {"prompt": "0.000001", "completion": "0.000005"}},
+    {"id": "anthropic/claude-sonnet-5.5:batch", "created": 301, "pricing": {"prompt": "0.0000015", "completion": "0.0000075"}},
+    {"id": "openai/gpt-6-luna", "created": 290, "pricing": {"prompt": "0.000002", "completion": "0.000010"}},
+    {"id": "openai/gpt-6-luna-mini", "created": 295, "pricing": {"prompt": "0.0000004", "completion": "0.0000016"}},
+    {"id": "google/gemini-4-pro", "created": 280, "pricing": {"prompt": "0.000002", "completion": "0.000012"}},
+    {"id": "google/gemini-4-flash", "created": 285, "pricing": {"prompt": "0.0000003", "completion": "0.0000025"}},
+]
+
+
+def test_resolve_keeps_available_and_replaces_retired():
+    requested = [
+        "openrouter/anthropic/claude-sonnet-5.5",  # still served
+        "openrouter/openai/gpt-5",  # retired
+        "openrouter/google/gemini-2.5-pro",  # retired
+    ]
+    assert ensemble_bot.resolve_models(requested, CATALOG) == [
+        "openrouter/anthropic/claude-sonnet-5.5",
+        "openrouter/openai/gpt-6-luna",
+        "openrouter/google/gemini-4-pro",
+    ]
+
+
+def test_replacement_skips_expensive_small_and_batch_variants():
+    # opus is newest but too expensive; haiku/:batch are not main models
+    assert ensemble_bot.best_in_family("anthropic", CATALOG) == "anthropic/claude-sonnet-5.5"
+    assert ensemble_bot.best_in_family("anthropic", CATALOG, cheap=True) == "anthropic/claude-haiku-5.5"
+
+
+def test_resolve_without_catalog_keeps_request():
+    assert ensemble_bot.resolve_models(["openrouter/x/y"], None) == ["openrouter/x/y"]
+
+
+def test_helper_llms_never_use_retired_template_defaults(monkeypatch):
+    for k in ("ASKNEWS_CLIENT_ID", "ASKNEWS_SECRET", "ASKNEWS_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    llms = ensemble_bot.helper_llms(["openrouter/anthropic/claude-sonnet-5.5"], CATALOG)
+    assert llms["parser"].model == "openrouter/anthropic/claude-haiku-5.5"
+    assert llms["researcher"].model == "openrouter/anthropic/claude-sonnet-5.5:online"
+    monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
+    monkeypatch.setenv("ASKNEWS_SECRET", "s")
+    assert ensemble_bot.helper_llms(["openrouter/a/b"], CATALOG)["researcher"] == "asknews/news-summaries"
+
+
+def test_bot_init_resolves_models_from_live_list(monkeypatch):
+    monkeypatch.setattr(ensemble_bot, "fetch_openrouter_models", lambda: CATALOG)
+    monkeypatch.delenv("BOT_MODELS", raising=False)
+    bot = EnsembleBot(publish_reports_to_metaculus=False)
+    panel = [llm.model for llm in bot._forecasters]
+    assert "openrouter/openai/gpt-5" not in panel
+    assert bot.get_llm("parser", "llm").model == "openrouter/anthropic/claude-haiku-5.5"
+
+
+def test_failed_research_does_not_kill_the_question(monkeypatch):
+    bot = make_bot(monkeypatch)
+
+    async def broken(self, question):
+        raise RuntimeError("model retired")
+
+    monkeypatch.setattr(ensemble_bot.FallTemplateBot2026, "run_research", broken)
+    report = asyncio.run(bot.forecast_question(make_question()))
+    assert abs(report.prediction - 0.30) < 1e-9
