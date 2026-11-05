@@ -1,0 +1,67 @@
+name: Research brief for human contests
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Metaculus question links (space separated). Leave empty for all open Metaculus Cup questions."
+        required: false
+        default: ""
+      max_questions:
+        description: "Most questions to research (cost control, about $0.25-0.50 each)"
+        required: false
+        default: "20"
+
+# Add concurrency group to prevent parallel runs
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+
+# Manual job: research only, never posts a forecast
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    steps: # sets up the steps that will be run in order
+      # setup repository with all necessary dependencies - keep as is
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.1"
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run bot
+        run: |
+          if [ -n "$URLS" ]; then
+            uv run python ensemble_bot.py --mode research --urls "$URLS" --max-questions "$MAX_QUESTIONS"
+          else
+            uv run python ensemble_bot.py --mode cup_research --max-questions "$MAX_QUESTIONS"
+          fi
+        # this reads the environment variables from the github repository.
+        # Store under Settings --> Secrets and variables --> Actions
+        env:
+          # Inputs are passed as variables, never pasted into the script.
+          URLS: ${{ inputs.urls }}
+          MAX_QUESTIONS: ${{ inputs.max_questions }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          BOT_MODELS: ${{ vars.BOT_MODELS }}
+          BOT_RUNS: ${{ vars.BOT_RUNS }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+      - name: Save the research brief
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-brief
+          path: research_reports/
+          if-no-files-found: warn
