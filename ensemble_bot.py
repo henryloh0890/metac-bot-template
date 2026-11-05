@@ -300,6 +300,52 @@ class EnsembleBot(FallTemplateBot2026):
         )
 
 
+RESEARCH_DIR = "research_reports"
+
+
+def write_research_brief(reports: list, path: str) -> int:
+    """Write one readable Markdown file for a human forecaster.
+
+    Used for human contests (Metaculus Cup and similar) where bots cannot win:
+    the bot does the research and gives a starting estimate; the human reads
+    it, decides, and enters their own forecast by hand.
+    """
+    lines = [
+        "# Research brief",
+        "",
+        f"Made {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC. Nothing was posted to Metaculus.",
+        "",
+        "Contest rules allow AI help, but your forecast must be your own decision.",
+        "Read the reasoning, check the sources, then enter your own number.",
+        "",
+    ]
+    count = 0
+    for report in reports:
+        if isinstance(report, BaseException) or report is None:
+            continue
+        count += 1
+        question = report.question
+        try:
+            estimate = report.make_readable_prediction(report.prediction)
+        except Exception:
+            estimate = str(report.prediction)
+        lines += [
+            "---",
+            "",
+            f"## {count}. {question.question_text}",
+            "",
+            f"- Link: {question.page_url}",
+            f"- Bot panel estimate (median): **{estimate}**",
+            "",
+            report.explanation,
+            "",
+        ]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return count
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -308,16 +354,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the ensemble forecasting bot")
     parser.add_argument(
         "--mode",
-        choices=["tournament", "minibench", "test_questions"],
+        choices=["tournament", "minibench", "test_questions", "cup_research", "research"],
         default="tournament",
-        help="tournament = Fall FutureEval + MiniBench; minibench = MiniBench only",
+        help=(
+            "tournament = Fall FutureEval + MiniBench; minibench = MiniBench only; "
+            "cup_research = research brief for open Metaculus Cup questions (never posts); "
+            "research = research brief for the questions given with --urls (never posts)"
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="forecast but do not post to Metaculus"
     )
+    parser.add_argument(
+        "--urls", default="", help="research mode: Metaculus question links, space or comma separated"
+    )
+    parser.add_argument(
+        "--max-questions", type=int, default=40, help="research modes: cap to control cost"
+    )
     args = parser.parse_args()
-    mode: Literal["tournament", "minibench", "test_questions"] = args.mode
-    publish = not args.dry_run
+    mode = args.mode
+    research_only = mode in ("cup_research", "research")
+    # Research modes are for human contests: never post a bot forecast there.
+    publish = not args.dry_run and not research_only
 
     check_environment(strict=True)
     print_startup_banner(mode, will_publish=publish)
@@ -330,11 +388,30 @@ def main() -> None:
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish,
         folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=not research_only,
         extra_metadata_in_explanation=True,
     )
 
     client = MetaculusClient()
+    reports = []
+    if research_only:
+        if mode == "research":
+            links = [u for u in re.split(r"[\s,]+", args.urls) if u]
+            if not links:
+                raise SystemExit("research mode needs --urls with at least one question link")
+            questions = [client.get_question_by_url(u) for u in links]
+        else:
+            questions = client.get_all_open_questions_from_tournament(
+                client.CURRENT_METACULUS_CUP_ID
+            )
+        questions = questions[: args.max_questions]
+        reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+        bot.log_report_summary(reports)
+        path = os.path.join(RESEARCH_DIR, f"brief-{datetime.now().strftime('%Y%m%d-%H%M')}.md")
+        n = write_research_brief(reports, path)
+        print(f"\n📝  Research brief with {n} question(s) written to {path} (nothing posted).")
+        return
+
     targets = {
         "tournament": [client.CURRENT_AI_COMPETITION_ID, client.CURRENT_MINIBENCH_ID],
         "minibench": [client.CURRENT_MINIBENCH_ID],
@@ -343,7 +420,6 @@ def main() -> None:
     if mode == "test_questions":
         bot.skip_previously_forecasted_questions = False
 
-    reports = []
     for target in targets:
         reports += asyncio.run(bot.forecast_on_tournament(target, return_exceptions=True))
 
