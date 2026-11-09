@@ -163,3 +163,40 @@ def test_failed_research_does_not_kill_the_question(monkeypatch):
     monkeypatch.setattr(ensemble_bot.FallTemplateBot2026, "run_research", broken)
     report = asyncio.run(bot.forecast_question(make_question()))
     assert abs(report.prediction - 0.30) < 1e-9
+
+
+# ---------------------------------------------------------------- research aid
+
+def test_research_brief_lists_questions_and_skips_errors(monkeypatch, tmp_path):
+    bot = make_bot(monkeypatch)
+    report = asyncio.run(bot.forecast_question(make_question()))
+    path = tmp_path / "brief.md"
+    n = ensemble_bot.write_research_brief([report, RuntimeError("failed one")], str(path))
+    text = path.read_text(encoding="utf-8")
+    assert n == 1
+    assert "Will X happen before 2026-11-30?" in text
+    assert "https://www.metaculus.com/questions/1/" in text
+    assert "30.0%" in text
+    assert "Nothing was posted" in text
+
+
+def test_research_modes_never_publish(monkeypatch, tmp_path):
+    seen = {}
+
+    class FakeClient:
+        CURRENT_METACULUS_CUP_ID = "cup"
+
+        def get_all_open_questions_from_tournament(self, tid):
+            return [make_question()]
+
+    def fake_bot(**kwargs):
+        seen.update(kwargs)
+        return make_bot(monkeypatch)
+
+    monkeypatch.setattr(ensemble_bot, "MetaculusClient", FakeClient)
+    monkeypatch.setattr(ensemble_bot, "EnsembleBot", fake_bot)
+    monkeypatch.setattr(ensemble_bot, "RESEARCH_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["ensemble_bot.py", "--mode", "cup_research"])
+    ensemble_bot.main()
+    assert seen["publish_reports_to_metaculus"] is False
+    assert len(list(tmp_path.glob("brief-*.md"))) == 1
