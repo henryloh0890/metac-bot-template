@@ -200,3 +200,11 @@ def test_research_modes_never_publish(monkeypatch, tmp_path):
     ensemble_bot.main()
     assert seen["publish_reports_to_metaculus"] is False
     assert len(list(tmp_path.glob("brief-*.md"))) == 1
+
+
+def test_every_llm_caps_output_tokens():
+    # An uncapped request reserves 64k tokens and fails on a low balance.
+    assert make_llm("openrouter/a/b").litellm_kwargs.get("max_tokens") == ensemble_bot.MAX_OUTPUT_TOKENS
+    llms = ensemble_bot.helper_llms(["openrouter/anthropic/claude-sonnet-5.5"], CATALOG)
+    for name in ("parser", "summarizer"):
+        assert llms[name].litellm_kwargs.get("max_tokens") == ensemble_bot.MAX_OUTPUT_TOKENS
