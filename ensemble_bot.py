@@ -86,8 +86,19 @@ BINARY_MAX = 0.98
 _NO_TEMPERATURE_MARKERS = ("gpt-5", "/o1", "/o3", "/o4")
 
 
+# Cap on output tokens per call. Without it OpenRouter reserves the model's
+# full maximum (64k tokens, about $1 per call) and refuses the request once the
+# balance runs low, even though a forecast needs only a few thousand tokens.
+MAX_OUTPUT_TOKENS = 12000
+
+
 def make_llm(model: str) -> GeneralLlm:
-    kwargs: dict = {"model": model, "timeout": 300, "allowed_tries": 2}
+    kwargs: dict = {
+        "model": model,
+        "timeout": 300,
+        "allowed_tries": 2,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+    }
     if not any(marker in model for marker in _NO_TEMPERATURE_MARKERS):
         kwargs["temperature"] = 0.3
     return GeneralLlm(**kwargs)
@@ -192,7 +203,12 @@ def helper_llms(panel: list[str], catalog: list[dict] | None) -> dict:
         llms["researcher"] = "asknews/news-summaries"
     else:
         # OpenRouter's ":online" suffix adds a web search to any model.
-        llms["researcher"] = GeneralLlm(model=panel[0] + ":online", temperature=0.1, timeout=300)
+        llms["researcher"] = GeneralLlm(
+            model=panel[0] + ":online",
+            temperature=0.1,
+            timeout=300,
+            max_tokens=MAX_OUTPUT_TOKENS,
+        )
     return llms
 
 
